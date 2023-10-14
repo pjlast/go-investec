@@ -18,23 +18,25 @@ import (
 )
 
 type Client struct {
-	apiKey     string
 	baseURL    string
-	auther     *investecAuth
+	auther     *Authenticator
 	httpClient *http.Client
 }
 
-type investecAuth struct {
+type Authenticator struct {
 	sync.Mutex
 
-	baseURL  string
-	clientID string
-	secret   string
-	apiKey   string
+	BaseURL  string
+	ClientID string
+	Secret   string
+	APIKey   string
 
-	token *oauth2.Token
+	OAuthToken *oauth2.Token
 
-	httpClient *http.Client
+	HTTPClient *http.Client
+
+	// PostRefreshHook is called after a new OAuth token is fetched successfully.
+	PostRefreshHook func(*oauth2.Token)
 }
 
 type tokenJSON struct {
@@ -74,14 +76,14 @@ func (t *Token) Valid() bool {
 	return false
 }
 
-func (a *investecAuth) Token() (*oauth2.Token, error) {
+func (a *Authenticator) Token() (*oauth2.Token, error) {
 	a.Lock()
 	defer a.Unlock()
-	if a.token.Valid() {
-		return a.token, nil
+	if a.OAuthToken.Valid() {
+		return a.OAuthToken, nil
 	}
 
-	reqURL, err := url.JoinPath(a.baseURL, "/identity/v2/oauth2/token")
+	reqURL, err := url.JoinPath(a.BaseURL, "/identity/v2/oauth2/token")
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +95,11 @@ func (a *investecAuth) Token() (*oauth2.Token, error) {
 		return nil, err
 	}
 
-	r.Header.Add("x-api-key", a.apiKey)
-	r.Header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", a.clientID, a.secret))))
+	r.Header.Add("x-api-key", a.APIKey)
+	r.Header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", a.ClientID, a.Secret))))
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := a.httpClient.Do(r)
+	resp, err := a.HTTPClient.Do(r)
 	if err != nil {
 		return nil, err
 	}
@@ -108,30 +110,27 @@ func (a *investecAuth) Token() (*oauth2.Token, error) {
 		return nil, err
 	}
 
-	a.token = &oauth2.Token{
+	a.OAuthToken = &oauth2.Token{
 		AccessToken: tk.AccessToken,
 		TokenType:   tk.TokenType,
 		Expiry:      tk.Expiry.Time,
 	}
 
-	a.token.WithExtra(map[string]interface{}{
+	a.OAuthToken.WithExtra(map[string]interface{}{
 		"scope": tk.Scope,
 	})
 
-	return a.token, nil
+	if a.PostRefreshHook != nil {
+		a.PostRefreshHook(a.OAuthToken)
+	}
+
+	return a.OAuthToken, nil
 }
 
-func NewClient(ctx context.Context, baseURL, clientID, secret, apiKey string) Client {
-	return Client{
-		apiKey:  apiKey,
+func NewClient(ctx context.Context, baseURL string, a *Authenticator) *Client {
+	return &Client{
 		baseURL: baseURL,
-		auther: &investecAuth{
-			baseURL:    baseURL,
-			clientID:   clientID,
-			secret:     secret,
-			apiKey:     apiKey,
-			httpClient: &http.Client{},
-		},
+		auther:     a,
 		httpClient: &http.Client{},
 	}
 }
