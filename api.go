@@ -522,15 +522,15 @@ func (c Client) TransferMultiple(ctx context.Context, accountID string, profileI
 		return nil, err
 	}
 
-	rBody := struct {
-		TransferList []Transfer `json:"transferList"`
-		ProfileID    string     `json:"profileId"`
-	}{
-		TransferList: transferList,
-		ProfileID:    profileID,
-	}
-
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, rBody)
+	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL,
+		struct {
+			TransferList []Transfer `json:"transferList"`
+			ProfileID    string     `json:"profileId"`
+		}{
+			TransferList: transferList,
+			ProfileID:    profileID,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -583,13 +583,13 @@ func (c Client) PayMultiple(ctx context.Context, accountID string, paymentList [
 		return nil, err
 	}
 
-	rBody := struct {
-		PaymentList []Payment `json:"paymentList"`
-	}{
-		PaymentList: paymentList,
-	}
-
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, rBody)
+	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL,
+		struct {
+			PaymentList []Payment `json:"paymentList"`
+		}{
+			PaymentList: paymentList,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
