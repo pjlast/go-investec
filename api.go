@@ -161,6 +161,9 @@ func (c Client) newAuthorizedRequest(ctx context.Context, method string, url str
 	if err != nil {
 		return nil, err
 	}
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
+	}
 
 	tok, err := c.auther.Token()
 	if err != nil {
@@ -531,7 +534,6 @@ func (c Client) TransferMultiple(ctx context.Context, accountID string, profileI
 	if err != nil {
 		return nil, err
 	}
-	r.Header.Set("Content-Type", "application/json")
 
 	resp, err := doRequest[struct {
 		TransferResponses []TransferResponse `json:"TransferResponses"`
@@ -591,7 +593,6 @@ func (c Client) PayMultiple(ctx context.Context, accountID string, paymentList [
 	if err != nil {
 		return nil, err
 	}
-	r.Header.Set("Content-Type", "application/json")
 
 	resp, err := doRequest[struct {
 		TransferResponses []TransferResponse `json:"TransferResponses"`
