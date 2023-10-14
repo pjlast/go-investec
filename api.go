@@ -32,16 +32,33 @@ type investecAuth struct {
 	secret   string
 	apiKey   string
 
-	token *Token
+	token *oauth2.Token
 
 	httpClient *http.Client
 }
 
 type tokenJSON struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
-	Scope       string `json:"scope"`
+	AccessToken string     `json:"access_token"`
+	TokenType   string     `json:"token_type"`
+	Expiry      expiryTime `json:"expires_in"`
+	Scope       string     `json:"scope"`
+}
+
+// expiryTime is an intermediary struct that converts an `expires_in` parameter
+// to an `expiry` parameter during JSON unmarshaling.
+type expiryTime struct {
+	time.Time
+}
+
+func (t *expiryTime) UnmarshalJSON(data []byte) error {
+	var expiresIn time.Duration
+	if err := json.Unmarshal(data, &expiresIn); err != nil {
+		return err
+	}
+
+	t.Time = time.Now().Add(time.Second * expiresIn)
+
+	return nil
 }
 
 type Token struct {
@@ -57,11 +74,7 @@ func (t *Token) Valid() bool {
 	return false
 }
 
-func (t tokenJSON) expiry() time.Time {
-	return time.Now().Add(time.Second * time.Duration(t.ExpiresIn))
-}
-
-func (a *investecAuth) Token() (*Token, error) {
+func (a *investecAuth) Token() (*oauth2.Token, error) {
 	a.Lock()
 	defer a.Unlock()
 	if a.token.Valid() {
@@ -95,14 +108,15 @@ func (a *investecAuth) Token() (*Token, error) {
 		return nil, err
 	}
 
-	a.token = &Token{
-		Token: &oauth2.Token{
-			AccessToken: tk.AccessToken,
-			TokenType:   tk.TokenType,
-			Expiry:      tk.expiry(),
-		},
-		Scope: tk.Scope,
+	a.token = &oauth2.Token{
+		AccessToken: tk.AccessToken,
+		TokenType:   tk.TokenType,
+		Expiry:      tk.Expiry.Time,
 	}
+
+	a.token.WithExtra(map[string]interface{}{
+		"scope": tk.Scope,
+	})
 
 	return a.token, nil
 }
@@ -133,8 +147,17 @@ type Account struct {
 	ProfileName   string `json:"profileName"`
 }
 
-func (c Client) newAuthorizedRequest(ctx context.Context, method string, url string, body io.Reader) (*http.Request, error) {
-	r, err := http.NewRequestWithContext(ctx, method, url, body)
+func (c Client) newAuthorizedRequest(ctx context.Context, method string, url string, body any) (*http.Request, error) {
+	var bdy io.Reader
+	if body != nil {
+		rBodyJSON, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		bdy = bytes.NewReader(rBodyJSON)
+	}
+
+	r, err := http.NewRequestWithContext(ctx, method, url, bdy)
 	if err != nil {
 		return nil, err
 	}
@@ -161,22 +184,11 @@ func (c Client) GetAccounts(ctx context.Context) ([]Account, error) {
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	accts, err := doRequest[struct {
+		Accounts []Account `json:"accounts"`
+	}](c.httpClient, r)
 
-	var respData struct {
-		Data struct {
-			Accounts []Account `json:"accounts"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data.Accounts, nil
+	return accts.Accounts, nil
 }
 
 type Balance struct {
@@ -201,32 +213,19 @@ func (c Client) GetAccountBalance(ctx context.Context, accountID string) (Balanc
 		return Balance{}, nil
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return Balance{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return Balance{}, errors.New(string(b))
-	}
-
-	var respData struct {
-		Data Balance `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return Balance{}, err
-	}
-
-	return respData.Data, nil
+	return doRequest[Balance](c.httpClient, r)
 }
 
-type Time struct {
+// apiTime is an intermediary struct that facilitates translation
+// from dates provided by Investec's API to standard time.Time.
+type apiTime struct {
 	time.Time
 }
 
-func (t *Time) UnmarshalJSON(data []byte) error {
+// UnmarshalJSON for apiTime infers which of the two date formats
+// the JSON is representing, and parses a time.Time object
+// accordingly.
+func (t *apiTime) UnmarshalJSON(data []byte) error {
 	var err error
 	var timeString string
 	if err = json.Unmarshal(data, &timeString); err != nil {
@@ -241,7 +240,7 @@ func (t *Time) UnmarshalJSON(data []byte) error {
 	return err
 }
 
-type Transaction struct {
+type transactionJSON struct {
 	AccountID       string  `json:"accountId"`
 	Type            string  `json:"type"`
 	TransactionType string  `json:"transactionType"`
@@ -249,12 +248,53 @@ type Transaction struct {
 	Description     string  `json:"description"`
 	CardNumber      string  `json:"cardNumber"`
 	PostedOrder     int     `json:"postedOrder"`
-	PostingDate     Time    `json:"postingDate"`
-	ValueDate       Time    `json:"valueDate"`
-	ActionDate      Time    `json:"actionDate"`
-	TransactionDate Time    `json:"transactionDate"`
+	PostingDate     apiTime `json:"postingDate"`
+	ValueDate       apiTime `json:"valueDate"`
+	ActionDate      apiTime `json:"actionDate"`
+	TransactionDate apiTime `json:"transactionDate"`
 	Amount          float64 `json:"amount"`
 	RunningBalance  float64 `json:"runningBalance"`
+}
+
+type Transaction struct {
+	AccountID       string
+	Type            string
+	TransactionType string
+	Status          string
+	Description     string
+	CardNumber      string
+	PostedOrder     int
+	PostingDate     time.Time
+	ValueDate       time.Time
+	ActionDate      time.Time
+	TransactionDate time.Time
+	Amount          float64
+	RunningBalance  float64
+}
+
+func (t *Transaction) UnmarshalJSON(data []byte) error {
+	var tj transactionJSON
+	if err := json.Unmarshal(data, &tj); err != nil {
+		return err
+	}
+
+	*t = Transaction{
+		AccountID:       tj.AccountID,
+		Type:            tj.Type,
+		TransactionType: tj.TransactionType,
+		Status:          tj.Status,
+		Description:     tj.Description,
+		CardNumber:      tj.CardNumber,
+		PostedOrder:     tj.PostedOrder,
+		PostingDate:     tj.PostingDate.Time,
+		ValueDate:       tj.ValueDate.Time,
+		ActionDate:      tj.ActionDate.Time,
+		TransactionDate: tj.TransactionDate.Time,
+		Amount:          tj.Amount,
+		RunningBalance:  tj.RunningBalance,
+	}
+
+	return nil
 }
 
 // GetAccountTransactions gets a list of account transactions for the provided account ID.
@@ -269,27 +309,15 @@ func (c Client) GetAccountTransactions(ctx context.Context, accountID string) ([
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
+	txs, err := doRequest[struct {
+		Transactions []Transaction `json:"transactions"`
+	}](c.httpClient, r)
+
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(string(b))
-	}
-
-	var respData struct {
-		Data struct {
-			Transactions []Transaction `json:"transactions"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data.Transactions, nil
+	return txs.Transactions, nil
 }
 
 type Profile struct {
@@ -310,20 +338,7 @@ func (c Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var respData struct {
-		Data []Profile `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data, nil
+	return doRequest[[]Profile](c.httpClient, r)
 }
 
 // GetProfileAccounts returns a list of accounts associated with the provided profile ID.
@@ -338,43 +353,70 @@ func (c Client) GetProfileAccounts(ctx context.Context, profileID string) ([]Acc
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	return doRequest[[]Account](c.httpClient, r)
+}
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(string(b))
-	}
-
-	var respData struct {
-		Data []Account `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data, nil
+type beneficiaryJSON struct {
+	ID                     string  `json:"beneficiaryId"`
+	AccountNumber          string  `json:"accountNumber"`
+	Code                   string  `json:"code"`
+	Bank                   string  `json:"bank"`
+	BeneficiaryName        string  `json:"beneficiaryName"`
+	LastPaymentAmount      string  `json:"lastPaymentAmount"`
+	LastPaymentDate        apiTime `json:"lastPaymentDate"`
+	CellNo                 string  `json:"cellNo"`
+	EmailAddress           string  `json:"emailAddress"`
+	Name                   string  `json:"name"`
+	ReferenceAccountNumber string  `json:"referenceAccountNumber"`
+	ReferenceName          string  `json:"referenceName"`
+	CategoryID             string  `json:"categoryId"`
+	ProfileID              string  `json:"profileId"`
+	FasterPaymentAllowed   bool    `json:"fasterPaymentAllowed"`
 }
 
 type Beneficiary struct {
-	BeneficiaryID          string `json:"beneficiaryId"`
-	AccountNumber          string `json:"accountNumber"`
-	Code                   string `json:"code"`
-	Bank                   string `json:"bank"`
-	BeneficiaryName        string `json:"beneficiaryName"`
-	LastPaymentAmount      string `json:"lastPaymentAmount"`
-	LastPaymentDate        Time   `json:"lastPaymentDate"`
-	CellNo                 string `json:"cellNo"`
-	EmailAddress           string `json:"emailAddress"`
-	Name                   string `json:"name"`
-	ReferenceAccountNumber string `json:"referenceAccountNumber"`
-	ReferenceName          string `json:"referenceName"`
-	CategoryID             string `json:"categoryId"`
-	ProfileID              string `json:"profileId"`
-	FasterPaymentAllowed   bool   `json:"fasterPaymentAllowed"`
+	ID                     string    `json:"beneficiaryId"`
+	AccountNumber          string    `json:"accountNumber"`
+	Code                   string    `json:"code"`
+	Bank                   string    `json:"bank"`
+	BeneficiaryName        string    `json:"beneficiaryName"`
+	LastPaymentAmount      string    `json:"lastPaymentAmount"`
+	LastPaymentDate        time.Time `json:"lastPaymentDate"`
+	CellNo                 string    `json:"cellNo"`
+	EmailAddress           string    `json:"emailAddress"`
+	Name                   string    `json:"name"`
+	ReferenceAccountNumber string    `json:"referenceAccountNumber"`
+	ReferenceName          string    `json:"referenceName"`
+	CategoryID             string    `json:"categoryId"`
+	ProfileID              string    `json:"profileId"`
+	FasterPaymentAllowed   bool      `json:"fasterPaymentAllowed"`
+}
+
+func (b *Beneficiary) UnmarshalJSON(data []byte) error {
+	var bj beneficiaryJSON
+	if err := json.Unmarshal(data, &bj); err != nil {
+		return err
+	}
+
+	*b = Beneficiary{
+		ID:                     bj.ID,
+		AccountNumber:          bj.AccountNumber,
+		Code:                   bj.Code,
+		Bank:                   bj.Bank,
+		BeneficiaryName:        bj.BeneficiaryName,
+		LastPaymentAmount:      bj.LastPaymentAmount,
+		LastPaymentDate:        bj.LastPaymentDate.Time,
+		CellNo:                 bj.CellNo,
+		EmailAddress:           bj.EmailAddress,
+		Name:                   bj.Name,
+		ReferenceAccountNumber: bj.ReferenceAccountNumber,
+		ReferenceName:          bj.ReferenceName,
+		CategoryID:             bj.CategoryID,
+		ProfileID:              bj.ProfileID,
+		FasterPaymentAllowed:   bj.FasterPaymentAllowed,
+	}
+
+	return nil
 }
 
 // GetAccountBeneficiaries lists the beneficiaries for the provided profile and account ID.
@@ -389,25 +431,7 @@ func (c Client) GetAccountBeneficiaries(ctx context.Context, profileID string, a
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(string(b))
-	}
-
-	var respData struct {
-		Data []Beneficiary `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data, nil
+	return doRequest[[]Beneficiary](c.httpClient, r)
 }
 
 // GetBeneficiaries lists the beneficiaries for the authenticated profile.
@@ -422,26 +446,13 @@ func (c Client) GetBeneficiaries(ctx context.Context) ([]Beneficiary, error) {
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var respData struct {
-		Data []Beneficiary `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data, nil
+	return doRequest[[]Beneficiary](c.httpClient, r)
 }
 
 type BeneficiaryCategory struct {
-	CategoryID      string `json:"CategoryId"`
-	DefaultCategory bool   `json:"DefaultCategory,string"`
-	CategoryName    string `json:"CategoryName"`
+	ID      string `json:"CategoryId"`
+	Default bool   `json:"DefaultCategory,string"`
+	Name    string `json:"CategoryName"`
 }
 
 // GetBeneficiaryCatagories lists all the beneficiary categories associated with the authenticated profile.
@@ -456,29 +467,43 @@ func (c Client) GetBeneficiaryCatagories(ctx context.Context) ([]BeneficiaryCate
 		return nil, err
 	}
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	return doRequest[[]BeneficiaryCategory](c.httpClient, r)
+}
 
-	var respData struct {
-		Data []BeneficiaryCategory `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	return respData.Data, nil
+type transferResponseJSON struct {
+	PaymentReferenceNumber string  `json:"PaymentReferenceNumber"`
+	PaymentDate            apiTime `json:"PaymentDate"`
+	Status                 string  `json:"Status"`
+	BeneficiaryName        string  `json:"BeneficiaryName"`
+	BeneficiaryAccountID   string  `json:"BeneficiaryAccountId"`
+	AuthorisationRequired  bool    `json:"AuthorisationRequired"`
 }
 
 type TransferResponse struct {
-	PaymentReferenceNumber string `json:"PaymentReferenceNumber"`
-	PaymentDate            Time   `json:"PaymentDate"`
-	Status                 string `json:"Status"`
-	BeneficiaryName        string `json:"BeneficiaryName"`
-	BeneficiaryAccountID   string `json:"BeneficiaryAccountId"`
-	AuthorisationRequired  bool   `json:"AuthorisationRequired"`
+	PaymentReferenceNumber string    `json:"PaymentReferenceNumber"`
+	PaymentDate            time.Time `json:"PaymentDate"`
+	Status                 string    `json:"Status"`
+	BeneficiaryName        string    `json:"BeneficiaryName"`
+	BeneficiaryAccountID   string    `json:"BeneficiaryAccountId"`
+	AuthorisationRequired  bool      `json:"AuthorisationRequired"`
+}
+
+func (tr *TransferResponse) UnmarshalJSON(data []byte) error {
+	var trj transferResponseJSON
+	if err := json.Unmarshal(data, &trj); err != nil {
+		return err
+	}
+
+	*tr = TransferResponse{
+		PaymentReferenceNumber: trj.PaymentReferenceNumber,
+		PaymentDate:            trj.PaymentDate.Time,
+		Status:                 trj.Status,
+		BeneficiaryName:        trj.BeneficiaryName,
+		BeneficiaryAccountID:   trj.BeneficiaryAccountID,
+		AuthorisationRequired:  trj.AuthorisationRequired,
+	}
+
+	return nil
 }
 
 type Transfer struct {
@@ -502,43 +527,44 @@ func (c Client) TransferMultiple(ctx context.Context, accountID string, profileI
 		ProfileID:    profileID,
 	}
 
-	rBodyJSON, err := json.Marshal(rBody)
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, bytes.NewBuffer(rBodyJSON))
+	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, rBody)
 	if err != nil {
 		return nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(r)
+	resp, err := doRequest[struct {
+		TransferResponses []TransferResponse `json:"TransferResponses"`
+		ErrorMessage      string             `json:"ErrorMessage"`
+	}](c.httpClient, r)
+
+	if resp.ErrorMessage != "" {
+		err = errors.New(resp.ErrorMessage)
+	}
+
+	return resp.TransferResponses, err
+}
+
+func doRequest[T any](c *http.Client, r *http.Request) (t T, _ error) {
+	resp, err := c.Do(r)
 	if err != nil {
-		return nil, err
+		return t, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(string(b))
+		return t, errors.New(string(b))
 	}
 
 	var respData struct {
-		Data struct {
-			TransferResponses []TransferResponse `json:"TransferResponses"`
-			ErrorMessage      string             `json:"ErrorMessage"`
-		} `json:"data"`
+		Data T `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
+		return t, err
 	}
 
-	if respData.Data.ErrorMessage != "" {
-		err = errors.New(respData.Data.ErrorMessage)
-	}
-
-	return respData.Data.TransferResponses, err
+	return respData.Data, nil
 }
 
 type Payment struct {
@@ -561,41 +587,20 @@ func (c Client) PayMultiple(ctx context.Context, accountID string, paymentList [
 		PaymentList: paymentList,
 	}
 
-	rBodyJSON, err := json.Marshal(rBody)
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, bytes.NewBuffer(rBodyJSON))
+	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL, rBody)
 	if err != nil {
 		return nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	resp, err := doRequest[struct {
+		TransferResponses []TransferResponse `json:"TransferResponses"`
+		ErrorMessage      string             `json:"ErrorMessage"`
+	}](c.httpClient, r)
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(string(b))
+	if resp.ErrorMessage != "" {
+		err = errors.New(resp.ErrorMessage)
 	}
 
-	var respData struct {
-		Data struct {
-			TransferResponses []TransferResponse `json:"TransferResponses"`
-			ErrorMessage      string             `json:"ErrorMessage"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return nil, err
-	}
-
-	if respData.Data.ErrorMessage != "" {
-		err = errors.New(respData.Data.ErrorMessage)
-	}
-
-	return respData.Data.TransferResponses, err
+	return resp.TransferResponses, err
 }
