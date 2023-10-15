@@ -76,7 +76,7 @@ func (t *Token) Valid() bool {
 	return false
 }
 
-func (a *Authenticator) Token() (*oauth2.Token, error) {
+func (a *Authenticator) Token(ctx context.Context) (*oauth2.Token, error) {
 	a.Lock()
 	defer a.Unlock()
 	if a.OAuthToken.Valid() {
@@ -90,7 +90,7 @@ func (a *Authenticator) Token() (*oauth2.Token, error) {
 
 	body := url.Values{}
 	body.Set("grant_type", "client_credentials")
-	r, err := http.NewRequest(http.MethodPost, reqURL, strings.NewReader(body.Encode()))
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(body.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -127,9 +127,9 @@ func (a *Authenticator) Token() (*oauth2.Token, error) {
 	return a.OAuthToken, nil
 }
 
-func NewClient(ctx context.Context, baseURL string, a *Authenticator) *Client {
+func NewClient(baseURL string, a *Authenticator) *Client {
 	return &Client{
-		baseURL: baseURL,
+		baseURL:    baseURL,
 		auther:     a,
 		httpClient: &http.Client{},
 	}
@@ -164,7 +164,7 @@ func (c Client) newAuthorizedRequest(ctx context.Context, method string, url str
 		r.Header.Set("Content-Type", "application/json")
 	}
 
-	tok, err := c.auther.Token()
+	tok, err := c.auther.Token(ctx)
 	if err != nil {
 		return nil, err
 	}
