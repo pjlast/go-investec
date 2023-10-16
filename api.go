@@ -299,11 +299,32 @@ func (t *Transaction) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type GetTransactionsOpts struct {
+	FromDate        time.Time
+	ToDate          time.Time
+	TransactionType string
+}
+
 // GetAccountTransactions gets a list of account transactions for the provided account ID.
-func (c Client) GetAccountTransactions(ctx context.Context, accountID string) ([]Transaction, error) {
+func (c Client) GetAccountTransactions(ctx context.Context, accountID string, opts GetTransactionsOpts) ([]Transaction, error) {
 	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/accounts/%s/transactions", accountID))
 	if err != nil {
 		return nil, err
+	}
+
+	var params url.Values
+	if !opts.FromDate.IsZero() {
+		params.Set("fromDate", opts.FromDate.Format(time.DateOnly))
+	}
+	if !opts.ToDate.IsZero() {
+		params.Set("toDate", opts.ToDate.Format(time.DateOnly))
+	}
+	if opts.TransactionType != "" {
+		params.Set("transactionType", opts.TransactionType)
+	}
+
+	if len(params) > 0 {
+		reqURL += "?" + params.Encode()
 	}
 
 	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
