@@ -3,7 +3,6 @@ package goinvestec
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,127 +10,90 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
+const (
+	productionURL = "https://openapi.investec.com"
+
+	sandboxURL          = "https://openapisandbox.investec.com"
+	sandboxClientID     = "yAxzQRFX97vOcyQAwluEU6H6ePxMA5eY"
+	sandboxClientSecret = "4dY0PjEYqoBrZ99r"
+	sandboxAPIKey       = "eUF4elFSRlg5N3ZPY3lRQXdsdUVVNkg2ZVB4TUE1ZVk6YVc1MlpYTjBaV010ZW1FdGNHSXRZV05qYjNWdWRITXRjMkZ1WkdKdmVBPT0="
+)
+
+// Client is a client for the Investec API.
 type Client struct {
-	baseURL    string
-	auther     *Authenticator
-	httpClient *http.Client
-}
+	// BaseURL is the URL of the server to which requests should be sent.
+	// BaseURL should never be specified with a trailing slash.
+	//
+	// Production URL: "https://openapi.investec.com"
+	// Sandbox URL: "https://openapisandbox.investec.com"
+	BaseURL string
 
-type Authenticator struct {
-	sync.Mutex
-
-	BaseURL  string
-	ClientID string
-	Secret   string
-	APIKey   string
-
-	OAuthToken *oauth2.Token
-
+	// HTTPClient is the underlying HTTP client to use when making requests,
+	// and is responsible for authenticating requests before executing them.
+	//
+	// Should never be nil.
 	HTTPClient *http.Client
-
-	// PostRefreshHook is called after a new OAuth token is fetched successfully.
-	PostRefreshHook func(*oauth2.Token)
 }
 
-type tokenJSON struct {
-	AccessToken string     `json:"access_token"`
-	TokenType   string     `json:"token_type"`
-	Expiry      expiryTime `json:"expires_in"`
-	Scope       string     `json:"scope"`
-}
-
-// expiryTime is an intermediary struct that converts an `expires_in` parameter
-// to an `expiry` parameter during JSON unmarshaling.
-type expiryTime struct {
-	time.Time
-}
-
-func (t *expiryTime) UnmarshalJSON(data []byte) error {
-	var expiresIn time.Duration
-	if err := json.Unmarshal(data, &expiresIn); err != nil {
-		return err
+// NewAuthorizedClient returns a Client with an authorized http.Client.
+//
+// The http.Client caches tokens in-memory and will re-use them if they are
+// still valid, otherwise it will fetch a new token.
+//
+// If you require a longer-living cache, consider creating a Client struct
+// yourself and providing your own http.Client that handles authentication
+// and caching.
+func NewAuthorizedClient(clientID, clientSecret, apiKey string) *Client {
+	c := &http.Client{
+		Transport: &Transport{
+			APIKey: apiKey,
+		},
 	}
 
-	t.Time = time.Now().Add(time.Second * expiresIn)
-
-	return nil
-}
-
-type Token struct {
-	*oauth2.Token
-	Scope string
-}
-
-func (t *Token) Valid() bool {
-	if t != nil && t.Token != nil {
-		return t.Token.Valid()
+	conf := &clientcredentials.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		TokenURL:     "https://openapi.investec.com/identity/v2/oauth2/token",
+		AuthStyle:    oauth2.AuthStyleInHeader,
 	}
 
-	return false
-}
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, c)
 
-func (a *Authenticator) Token(ctx context.Context) (*oauth2.Token, error) {
-	a.Lock()
-	defer a.Unlock()
-	if a.OAuthToken.Valid() {
-		return a.OAuthToken, nil
-	}
-
-	reqURL, err := url.JoinPath(a.BaseURL, "/identity/v2/oauth2/token")
-	if err != nil {
-		return nil, err
-	}
-
-	body := url.Values{}
-	body.Set("grant_type", "client_credentials")
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(body.Encode()))
-	if err != nil {
-		return nil, err
-	}
-
-	r.Header.Add("x-api-key", a.APIKey)
-	r.Header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", a.ClientID, a.Secret))))
-	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := a.HTTPClient.Do(r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var tk tokenJSON
-	if err := json.NewDecoder(resp.Body).Decode(&tk); err != nil {
-		return nil, err
-	}
-
-	a.OAuthToken = &oauth2.Token{
-		AccessToken: tk.AccessToken,
-		TokenType:   tk.TokenType,
-		Expiry:      tk.Expiry.Time,
-	}
-
-	a.OAuthToken.WithExtra(map[string]interface{}{
-		"scope": tk.Scope,
-	})
-
-	if a.PostRefreshHook != nil {
-		a.PostRefreshHook(a.OAuthToken)
-	}
-
-	return a.OAuthToken, nil
-}
-
-func NewClient(baseURL string, a *Authenticator) *Client {
 	return &Client{
-		baseURL:    baseURL,
-		auther:     a,
-		httpClient: &http.Client{},
+		BaseURL:    "https://openapi.investec.com",
+		HTTPClient: conf.Client(ctx),
+	}
+}
+
+// NewSandboxClient returns a Client that communicates and authenticates
+// with the Investec sandbox API.
+//
+// Useful for experimentation.
+func NewSandboxClient() *Client {
+	c := &http.Client{
+		Transport: &Transport{
+			APIKey: sandboxAPIKey,
+		},
+	}
+
+	conf := &clientcredentials.Config{
+		ClientID:     sandboxClientID,
+		ClientSecret: sandboxClientSecret,
+		TokenURL:     sandboxURL + "/identity/v2/oauth2/token",
+		AuthStyle:    oauth2.AuthStyleInHeader,
+	}
+
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, c)
+
+	return &Client{
+		BaseURL:    sandboxURL,
+		HTTPClient: conf.Client(ctx),
 	}
 }
 
@@ -146,7 +108,7 @@ type Account struct {
 	ProfileName   string `json:"profileName"`
 }
 
-func (c Client) newAuthorizedRequest(ctx context.Context, method string, url string, body any) (*http.Request, error) {
+func (c Client) newRequest(ctx context.Context, method string, path string, body any) (*http.Request, error) {
 	var bdy io.Reader
 	if body != nil {
 		rBodyJSON, err := json.Marshal(body)
@@ -156,7 +118,7 @@ func (c Client) newAuthorizedRequest(ctx context.Context, method string, url str
 		bdy = bytes.NewReader(rBodyJSON)
 	}
 
-	r, err := http.NewRequestWithContext(ctx, method, url, bdy)
+	r, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bdy)
 	if err != nil {
 		return nil, err
 	}
@@ -164,31 +126,19 @@ func (c Client) newAuthorizedRequest(ctx context.Context, method string, url str
 		r.Header.Set("Content-Type", "application/json")
 	}
 
-	tok, err := c.auther.Token(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	tok.SetAuthHeader(r)
-
 	return r, nil
 }
 
 // GetAccounts returns a list of accounts for the authenticated client.
 func (c Client) GetAccounts(ctx context.Context) ([]Account, error) {
-	reqURL, err := url.JoinPath(c.baseURL, "/za/pb/v1/accounts")
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
+	r, err := c.newRequest(ctx, http.MethodGet, "/za/pb/v1/accounts", nil)
 	if err != nil {
 		return nil, err
 	}
 
 	accts, err := doRequest[struct {
 		Accounts []Account `json:"accounts"`
-	}](c.httpClient, r)
+	}](c.HTTPClient, r)
 
 	return accts.Accounts, nil
 }
@@ -205,17 +155,14 @@ type Balance struct {
 
 // GetAccountBalance returns the balance for the provided accountID.
 func (c Client) GetAccountBalance(ctx context.Context, accountID string) (Balance, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/accounts/%s/balance", accountID))
-	if err != nil {
-		return Balance{}, err
-	}
+	path := fmt.Sprintf("/za/pb/v1/accounts/%s/balance", accountID)
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
+	r, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return Balance{}, nil
 	}
 
-	return doRequest[Balance](c.httpClient, r)
+	return doRequest[Balance](c.HTTPClient, r)
 }
 
 // apiTime is an intermediary struct that facilitates translation
@@ -307,10 +254,7 @@ type GetTransactionsOpts struct {
 
 // GetAccountTransactions gets a list of account transactions for the provided account ID.
 func (c Client) GetAccountTransactions(ctx context.Context, accountID string, opts GetTransactionsOpts) ([]Transaction, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/accounts/%s/transactions", accountID))
-	if err != nil {
-		return nil, err
-	}
+	path := fmt.Sprintf("/za/pb/v1/accounts/%s/transactions", accountID)
 
 	var params url.Values
 	if !opts.FromDate.IsZero() {
@@ -324,18 +268,17 @@ func (c Client) GetAccountTransactions(ctx context.Context, accountID string, op
 	}
 
 	if len(params) > 0 {
-		reqURL += "?" + params.Encode()
+		path += "?" + params.Encode()
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
+	r, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	txs, err := doRequest[struct {
 		Transactions []Transaction `json:"transactions"`
-	}](c.httpClient, r)
-
+	}](c.HTTPClient, r)
 	if err != nil {
 		return nil, err
 	}
@@ -351,32 +294,24 @@ type Profile struct {
 
 // GetProfiles returns a list of profiles associated with the authenticatd user.
 func (c Client) GetProfiles(ctx context.Context) ([]Profile, error) {
-	reqURL, err := url.JoinPath(c.baseURL, "/za/pb/v1/profiles")
+	r, err := c.newRequest(ctx, http.MethodGet, "/za/pb/v1/profiles", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return doRequest[[]Profile](c.httpClient, r)
+	return doRequest[[]Profile](c.HTTPClient, r)
 }
 
 // GetProfileAccounts returns a list of accounts associated with the provided profile ID.
 func (c Client) GetProfileAccounts(ctx context.Context, profileID string) ([]Account, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/profiles/%s/accounts", profileID))
+	path := fmt.Sprintf("/za/pb/v1/profiles/%s/accounts", profileID)
+
+	r, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return doRequest[[]Account](c.httpClient, r)
+	return doRequest[[]Account](c.HTTPClient, r)
 }
 
 type beneficiaryJSON struct {
@@ -444,32 +379,24 @@ func (b *Beneficiary) UnmarshalJSON(data []byte) error {
 
 // GetAccountBeneficiaries lists the beneficiaries for the provided profile and account ID.
 func (c Client) GetAccountBeneficiaries(ctx context.Context, profileID string, accountID string) ([]Beneficiary, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/profiles/%s/accounts/%s/beneficiaries", profileID, accountID))
+	path := fmt.Sprintf("/za/pb/v1/profiles/%s/accounts/%s/beneficiaries", profileID, accountID)
+
+	r, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return doRequest[[]Beneficiary](c.httpClient, r)
+	return doRequest[[]Beneficiary](c.HTTPClient, r)
 }
 
 // GetBeneficiaries lists the beneficiaries for the authenticated profile.
 func (c Client) GetBeneficiaries(ctx context.Context) ([]Beneficiary, error) {
-	reqURL, err := url.JoinPath(c.baseURL, "/za/pb/v1/accounts/beneficiaries")
+	r, err := c.newRequest(ctx, http.MethodGet, "/za/pb/v1/accounts/beneficiaries", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return doRequest[[]Beneficiary](c.httpClient, r)
+	return doRequest[[]Beneficiary](c.HTTPClient, r)
 }
 
 type BeneficiaryCategory struct {
@@ -480,17 +407,12 @@ type BeneficiaryCategory struct {
 
 // GetBeneficiaryCatagories lists all the beneficiary categories associated with the authenticated profile.
 func (c Client) GetBeneficiaryCatagories(ctx context.Context) ([]BeneficiaryCategory, error) {
-	reqURL, err := url.JoinPath(c.baseURL, "/za/pb/v1/accounts/beneficiarycategories")
+	r, err := c.newRequest(ctx, http.MethodGet, "/za/pb/v1/accounts/beneficiarycategories", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return doRequest[[]BeneficiaryCategory](c.httpClient, r)
+	return doRequest[[]BeneficiaryCategory](c.HTTPClient, r)
 }
 
 type transferResponseJSON struct {
@@ -537,12 +459,9 @@ type Transfer struct {
 }
 
 func (c Client) TransferMultiple(ctx context.Context, accountID string, profileID string, transferList []Transfer) ([]TransferResponse, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/accounts/%s/transfermultiple", accountID))
-	if err != nil {
-		return nil, err
-	}
+	path := fmt.Sprintf("/za/pb/v1/accounts/%s/transfermultiple", accountID)
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL,
+	r, err := c.newRequest(ctx, http.MethodPost, path,
 		struct {
 			TransferList []Transfer `json:"transferList"`
 			ProfileID    string     `json:"profileId"`
@@ -558,7 +477,7 @@ func (c Client) TransferMultiple(ctx context.Context, accountID string, profileI
 	resp, err := doRequest[struct {
 		TransferResponses []TransferResponse `json:"TransferResponses"`
 		ErrorMessage      string             `json:"ErrorMessage"`
-	}](c.httpClient, r)
+	}](c.HTTPClient, r)
 
 	if resp.ErrorMessage != "" {
 		err = errors.New(resp.ErrorMessage)
@@ -598,12 +517,9 @@ type Payment struct {
 
 // PayMultiple executes all payments specified in the payment list.
 func (c Client) PayMultiple(ctx context.Context, accountID string, paymentList []Payment) ([]TransferResponse, error) {
-	reqURL, err := url.JoinPath(c.baseURL, fmt.Sprintf("/za/pb/v1/accounts/%s/paymultiple", accountID))
-	if err != nil {
-		return nil, err
-	}
+	path := fmt.Sprintf("/za/pb/v1/accounts/%s/paymultiple", accountID)
 
-	r, err := c.newAuthorizedRequest(ctx, http.MethodPost, reqURL,
+	r, err := c.newRequest(ctx, http.MethodPost, path,
 		struct {
 			PaymentList []Payment `json:"paymentList"`
 		}{
@@ -617,7 +533,7 @@ func (c Client) PayMultiple(ctx context.Context, accountID string, paymentList [
 	resp, err := doRequest[struct {
 		TransferResponses []TransferResponse `json:"TransferResponses"`
 		ErrorMessage      string             `json:"ErrorMessage"`
-	}](c.httpClient, r)
+	}](c.HTTPClient, r)
 
 	if resp.ErrorMessage != "" {
 		err = errors.New(resp.ErrorMessage)
